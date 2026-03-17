@@ -1,0 +1,97 @@
+name: NeuroAssist CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  # ── Job 1: Lint and import checks ─────────────────────────────────────────
+  lint:
+    name: Lint & Import Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check imports — config
+        run: python -c "import config; print('✅ config imports OK')"
+
+      - name: Check imports — embeddings
+        run: python -c "from backend.rag.embeddings import LocalEmbeddings; print('✅ embeddings imports OK')"
+
+      - name: Check imports — vectorstore
+        run: python -c "from backend.rag.vectorstore import get_vectorstore; print('✅ vectorstore imports OK')"
+
+      - name: Check imports — schemas
+        run: python -c "from backend.api.schemas import QuestionRequest, AnswerResponse; print('✅ schemas imports OK')"
+
+      - name: Check imports — agent state
+        run: python -c "from backend.agent.state import AgentState, get_initial_state; print('✅ agent state imports OK')"
+
+      - name: Check imports — graph builder
+        run: python -c "from backend.rag.knowledge_graph.graph_builder import build_full_graph; print('✅ graph builder imports OK')"
+
+  # ── Job 2: Unit tests ──────────────────────────────────────────────────────
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          NCBI_API_KEY: ${{ secrets.NCBI_API_KEY }}
+          CHROMA_PERSIST_DIR: ./data/chroma_db
+          PAPERS_COLLECTION: lab_papers
+          CODE_COLLECTION: pipeline_code
+          EMBEDDING_MODEL: BAAI/bge-small-en-v1.5
+          LLM_MODEL: llama-3.3-70b-versatile
+
+  # ── Job 3: Docker build check ──────────────────────────────────────────────
+  docker:
+    name: Docker Build Check
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build backend image
+        run: docker build -f Dockerfile.backend -t neuroassist-backend .
+
+      - name: Build frontend image
+        run: docker build -f Dockerfile.frontend -t neuroassist-frontend .
+
+      - name: Verify backend image
+        run: docker inspect neuroassist-backend
+
+      - name: Verify frontend image
+        run: docker inspect neuroassist-frontend
