@@ -1,0 +1,21 @@
+# Environment
+.env
+neuroassist-env/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Data - never push to GitHub
+data/papers/
+data/code_files/
+data/chroma_db/
+
+# VS Code
+.vscode/
+
+# Mac
+.DS_Store
+
+# Sentence transformers cache
+.cache/

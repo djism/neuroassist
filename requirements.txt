@@ -1,0 +1,42 @@
+# Agent
+langchain
+langchain-groq
+langchain-community
+langgraph
+
+# Embeddings - free, runs locally
+sentence-transformers
+
+# Vector store
+chromadb
+
+# Evaluation
+ragas
+datasets
+
+# Knowledge graph
+networkx
+
+# API
+fastapi
+uvicorn
+pydantic
+
+# Frontend
+streamlit
+requests
+
+# Data loading
+pypdf
+tiktoken
+
+# PubMed
+biopython
+
+# Testing
+pytest
+pytest-asyncio
+httpx
+
+# Utils
+python-dotenv
