@@ -10,7 +10,7 @@ ssl._create_default_https_context = ssl.create_default_context
 os.environ['SSL_CERT_FILE'] = certifi.where()
 
 sys.path.append(str(Path(__file__).resolve().parents[2]))
-from config import GROQ_API_KEY, LLM_MODEL
+from config import GROQ_API_KEY, LLM_MODEL, RAGAS_ENABLED
 from backend.agent.state import AgentState
 from backend.rag.retriever import get_retriever
 from backend.tools.pubmed import search_and_format
@@ -18,17 +18,16 @@ from backend.tools.pubmed import search_and_format
 
 # ── LLM setup ─────────────────────────────────────────────────────────────────
 def get_llm() -> ChatGroq:
-    """Returns Groq LLM instance."""
     return ChatGroq(
         api_key=GROQ_API_KEY,
         model=LLM_MODEL,
-        temperature=0.2,       # low temperature = more factual, less creative
+        temperature=0.2,
         max_tokens=1024
     )
 
 
 # ── System prompt ─────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are NeuroAssist, an intelligent research assistant for the Shrestha Lab 
+SYSTEM_PROMPT = """You are NeuroAssist, an intelligent research assistant for the Shrestha Lab
 at Stony Brook University (Department of Neurobiology & Behavior).
 
 You have access to:
@@ -54,27 +53,30 @@ You serve two types of users:
 Adapt your language to the question's complexity."""
 
 
+# ── Sufficiency check prompt ──────────────────────────────────────────────────
+SUFFICIENCY_CHECK_PROMPT = """You are checking if the provided context contains enough 
+information to answer the question.
+
+Question: {question}
+
+Context (first 500 chars): {context_preview}
+
+Reply with ONLY one word: YES if the context can answer the question, NO if it cannot.
+Do not explain. Just YES or NO."""
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # NODE 1: ROUTER
-# Decides which tools to use based on the question
 # ══════════════════════════════════════════════════════════════════════════════
 
 def router_node(state: AgentState) -> AgentState:
     """
     Analyzes the question and decides which retrieval path to take.
-
-    Routes:
-    - "papers"          → question about lab research, findings, methods
-    - "code"            → question about pipeline code, implementation
-    - "graph"           → question about lab overview, relationships, structure
-    - "pubmed"          → question needs external literature beyond lab papers
-    - "papers_and_code" → question touches both research and implementation
+    Routes: papers, code, graph, pubmed, papers_and_code
     """
     question = state["question"].lower()
-
     print(f"\n🔀 Router analyzing: '{state['question'][:60]}...'")
 
-    # Code-related keywords
     code_keywords = [
         "code", "file", "function", "implement", "pipeline", "script",
         "how does", "how do", "where is", "which file", "class", "method",
@@ -83,25 +85,25 @@ def router_node(state: AgentState) -> AgentState:
         "preprocessing", "loader", "parser", "scanner", "plotter"
     ]
 
-    # Graph/overview keywords
     graph_keywords = [
-    "what does the lab", "what does this lab", "lab do",
-    "overview", "summary", "about the lab", "who is", "professor",
-    "techniques used", "paradigms", "brain regions", "what files",
-    "all files", "dependencies", "depends on", "structure",
-    "list all", "what is the lab", "shrestha lab",
-    "what does the shrestha", "what does prof",
-    "about this lab", "tell me about the lab"
+        "what does the lab", "what does this lab", "lab do",
+        "overview", "summary", "about the lab", "who is", "professor",
+        "techniques used", "paradigms", "brain regions", "what files",
+        "all files", "dependencies", "depends on", "structure",
+        "list all", "what is the lab", "shrestha lab",
+        "what does the shrestha", "what does prof",
+        "about this lab", "tell me about the lab",
+        "paradigm", "technique", "brain region",
+        "what does the lab", "what does this lab", "lab study",
+        "lab do", "lab use", "lab research"
     ]
 
-    # PubMed keywords — needs external literature
     pubmed_keywords = [
         "recent papers", "latest research", "find papers", "search pubmed",
         "published recently", "other labs", "literature", "not in the lab",
         "general research", "field of", "state of the art"
     ]
 
-    # Determine route
     is_code = any(kw in question for kw in code_keywords)
     is_graph = any(kw in question for kw in graph_keywords)
     is_pubmed = any(kw in question for kw in pubmed_keywords)
@@ -109,14 +111,13 @@ def router_node(state: AgentState) -> AgentState:
     if is_graph:
         route = "graph"
     elif is_code and not is_graph:
-        # Check if it also needs paper context
         paper_keywords = ["paper", "study", "finding", "result", "publish"]
         also_papers = any(kw in question for kw in paper_keywords)
         route = "papers_and_code" if also_papers else "code"
     elif is_pubmed:
         route = "pubmed"
     else:
-        route = "papers"  # default — most questions are about research
+        route = "papers"
 
     print(f"   ✅ Route decided: {route}")
     return {**state, "route": route}
@@ -124,60 +125,56 @@ def router_node(state: AgentState) -> AgentState:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NODE 2: PAPERS RETRIEVER
-# Fetches context from lab papers vector store
 # ══════════════════════════════════════════════════════════════════════════════
 
 def papers_retriever_node(state: AgentState) -> AgentState:
     """
-    Retrieves relevant chunks from the lab papers ChromaDB collection.
-    Also adds graph context for richer answers.
+    Two-stage retrieval over lab papers:
+    1. ChromaDB vector search (cast wide net)
+    2. CrossEncoder reranking (keep most relevant)
+    Sets needs_pubmed_fallback=True if results are insufficient.
     """
-    print(f"\n📚 Retrieving from lab papers...")
+    print(f"\n📚 Retrieving from lab papers (with reranking)...")
     retriever = get_retriever()
 
-    # Vector search over papers
     results = retriever.search_papers(state["question"], k=5)
     papers_context = retriever.format_vector_results(results)
 
-    # Also get graph context for related concepts
+    # Check if retrieved chunks actually answer the question
+    sufficient = retriever.papers_are_sufficient(state["question"], results)
+
     graph_context = retriever.search_graph(state["question"].split()[0])
 
-    # Extract source names
-    sources = list({
-        r["metadata"].get("source", "unknown")
-        for r in results
-    })
+    sources = list({r["metadata"].get("source", "unknown") for r in results})
 
-    print(f"   ✅ Retrieved {len(results)} paper chunks")
-    print(f"   Sources: {sources}")
+    print(f"   ✅ Retrieved {len(results)} chunks (reranked)")
+    print(f"   Sources   : {sources}")
+    print(f"   Sufficient: {sufficient}")
 
     return {
         **state,
         "papers_context": papers_context,
         "graph_context": graph_context,
-        "sources": sources
+        "sources": sources,
+        "needs_pubmed_fallback": not sufficient
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NODE 3: CODE RETRIEVER
-# Fetches context from pipeline code vector store
 # ══════════════════════════════════════════════════════════════════════════════
 
 def code_retriever_node(state: AgentState) -> AgentState:
     """
-    Retrieves relevant chunks from the pipeline code ChromaDB collection.
-    Also fetches file dependency information from knowledge graph.
+    Two-stage retrieval over pipeline code with reranking.
+    Also fetches file dependency info from knowledge graph.
     """
-    print(f"\n💻 Retrieving from pipeline code...")
+    print(f"\n💻 Retrieving from pipeline code (with reranking)...")
     retriever = get_retriever()
 
-    # Vector search over code
     results = retriever.search_code(state["question"], k=5)
     code_context = retriever.format_vector_results(results)
 
-    # Get file dependency graph context
-    # Try to find a filename mentioned in the question
     question_lower = state["question"].lower()
     py_files = [
         "saa_mouse", "base_mouse", "snippet_extractor", "peth_plotter",
@@ -189,44 +186,34 @@ def code_retriever_node(state: AgentState) -> AgentState:
         if fname in question_lower:
             graph_context = retriever.get_file_dependencies(f"{fname}.py")
             break
-
-    # If no specific file mentioned, get all files list
     if not graph_context:
         graph_context = retriever.get_all_code_files()
 
-    # Extract source names
-    sources = list({
-        r["metadata"].get("source", "unknown")
-        for r in results
-    })
+    sources = list({r["metadata"].get("source", "unknown") for r in results})
 
-    print(f"   ✅ Retrieved {len(results)} code chunks")
+    print(f"   ✅ Retrieved {len(results)} chunks (reranked)")
     print(f"   Sources: {sources}")
 
     return {
         **state,
         "code_context": code_context,
         "graph_context": graph_context,
-        "sources": sources
+        "sources": sources,
+        "needs_pubmed_fallback": False
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NODE 4: GRAPH RETRIEVER
-# Fetches structured info from knowledge graph
 # ══════════════════════════════════════════════════════════════════════════════
 
 def graph_retriever_node(state: AgentState) -> AgentState:
-    """
-    Retrieves structured information from the NetworkX knowledge graph.
-    Best for overview, relationship, and structural questions.
-    """
+    """Retrieves structured info from the NetworkX knowledge graph."""
     print(f"\n🧠 Retrieving from knowledge graph...")
     retriever = get_retriever()
 
     question_lower = state["question"].lower()
 
-    # Decide what to fetch from graph
     if any(kw in question_lower for kw in [
         "overview", "about the lab", "what does", "who is",
         "paradigm", "technique", "brain region", "shrestha lab",
@@ -241,7 +228,6 @@ def graph_retriever_node(state: AgentState) -> AgentState:
         sources = ["Knowledge Graph — Code Files"]
 
     elif "depends" in question_lower or "dependencies" in question_lower:
-        # Try to find filename in question
         py_files = [
             "saa_mouse", "base_mouse", "snippet_extractor", "peth_plotter",
             "group_analyzer", "preprocessing", "tdt_loader"
@@ -257,8 +243,8 @@ def graph_retriever_node(state: AgentState) -> AgentState:
             graph_context = retriever.get_lab_overview()
             sources = ["Knowledge Graph — Lab Overview"]
     else:
-        # Generic keyword search — skip short/common words
-        stopwords = {"what", "does", "the", "is", "how", "which", "who", "does", "do", "a", "an"}
+        stopwords = {"what", "does", "the", "is", "how", "which", "who",
+                     "do", "a", "an", "this", "that", "about"}
         keywords = [
             w for w in state["question"].lower().split()
             if len(w) > 3 and w not in stopwords
@@ -272,24 +258,20 @@ def graph_retriever_node(state: AgentState) -> AgentState:
     return {
         **state,
         "graph_context": graph_context,
-        "sources": sources
+        "sources": sources,
+        "needs_pubmed_fallback": False
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NODE 5: PAPERS AND CODE RETRIEVER
-# Fetches from both paper and code collections
 # ══════════════════════════════════════════════════════════════════════════════
 
 def papers_and_code_retriever_node(state: AgentState) -> AgentState:
-    """
-    Retrieves from both papers and code collections.
-    Used when question spans both research and implementation.
-    """
-    print(f"\n📚💻 Retrieving from papers AND code...")
+    """Retrieves from both papers and code with reranking."""
+    print(f"\n📚💻 Retrieving from papers AND code (with reranking)...")
     retriever = get_retriever()
 
-    # Search both
     paper_results = retriever.search_papers(state["question"], k=3)
     code_results = retriever.search_code(state["question"], k=3)
 
@@ -301,33 +283,28 @@ def papers_and_code_retriever_node(state: AgentState) -> AgentState:
         for r in paper_results + code_results
     })
 
-    print(f"   ✅ {len(paper_results)} paper chunks + {len(code_results)} code chunks")
+    print(f"   ✅ {len(paper_results)} paper + {len(code_results)} code chunks (reranked)")
 
     return {
         **state,
         "papers_context": papers_context,
         "code_context": code_context,
-        "sources": sources
+        "sources": sources,
+        "needs_pubmed_fallback": False
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NODE 6: PUBMED RETRIEVER
-# Fetches live papers from PubMed API
 # ══════════════════════════════════════════════════════════════════════════════
 
 def pubmed_retriever_node(state: AgentState) -> AgentState:
-    """
-    Searches PubMed for papers related to the question.
-    Also searches lab papers as supplementary context.
-    """
+    """Searches PubMed for papers related to the question."""
     print(f"\n🔬 Searching PubMed...")
     retriever = get_retriever()
 
-    # Search PubMed
     pubmed_context = search_and_format(state["question"], max_results=3)
 
-    # Also get some lab paper context for comparison
     paper_results = retriever.search_papers(state["question"], k=2)
     papers_context = retriever.format_vector_results(paper_results)
 
@@ -342,13 +319,43 @@ def pubmed_retriever_node(state: AgentState) -> AgentState:
         **state,
         "pubmed_context": pubmed_context,
         "papers_context": papers_context,
-        "sources": sources
+        "sources": sources,
+        "needs_pubmed_fallback": False
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 7: GENERATOR
-# Builds context and calls the LLM to generate the answer
+# NODE 7: PUBMED FALLBACK
+# Called automatically when local papers don't answer the question
+# ══════════════════════════════════════════════════════════════════════════════
+
+def pubmed_fallback_node(state: AgentState) -> AgentState:
+    """
+    Automatic PubMed fallback — triggered when the reranker determines
+    that local lab papers don't have sufficient context to answer.
+
+    This is what makes the agent genuinely autonomous:
+    it knows when it doesn't know something and goes to find more.
+    """
+    print(f"\n🔄 Local papers insufficient — falling back to PubMed...")
+
+    pubmed_context = search_and_format(state["question"], max_results=3)
+
+    existing_sources = state.get("sources", [])
+    updated_sources = list(set(existing_sources + ["PubMed (fallback)"]))
+
+    print(f"   ✅ PubMed fallback results retrieved")
+
+    return {
+        **state,
+        "pubmed_context": pubmed_context,
+        "sources": updated_sources,
+        "needs_pubmed_fallback": False
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NODE 8: GENERATOR
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generator_node(state: AgentState) -> AgentState:
@@ -359,7 +366,6 @@ def generator_node(state: AgentState) -> AgentState:
     print(f"\n✍️  Generating answer...")
     llm = get_llm()
 
-    # Build context block from whatever was retrieved
     context_parts = []
 
     if state.get("graph_context"):
@@ -378,7 +384,7 @@ def generator_node(state: AgentState) -> AgentState:
         context_parts.append("")
 
     if state.get("pubmed_context"):
-        context_parts.append("PUBMED SEARCH RESULTS:")
+        context_parts.append("PUBMED SEARCH RESULTS (external literature):")
         context_parts.append(state["pubmed_context"])
         context_parts.append("")
 
@@ -387,7 +393,6 @@ def generator_node(state: AgentState) -> AgentState:
     if not context.strip():
         context = "No context was retrieved for this question."
 
-    # Build the prompt
     user_prompt = f"""Based on the following context, please answer this question:
 
 QUESTION: {state["question"]}
@@ -397,9 +402,9 @@ CONTEXT:
 
 Please provide a clear, accurate answer based only on the context above.
 Cite the specific sources (paper names or file names) that support your answer.
+If PubMed results are included, note that they come from external literature.
 If the context does not contain enough information to answer fully, say so."""
 
-    # Call LLM
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=user_prompt)
@@ -410,7 +415,6 @@ If the context does not contain enough information to answer fully, say so."""
 
     print(f"   ✅ Answer generated ({len(answer)} chars)")
 
-    # Update message history
     updated_messages = list(state.get("messages", []))
     updated_messages.append(HumanMessage(content=state["question"]))
     updated_messages.append(AIMessage(content=answer))
@@ -423,26 +427,30 @@ If the context does not contain enough information to answer fully, say so."""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 8: EVALUATOR
-# Scores the answer using RAGAS metrics
+# NODE 9: EVALUATOR — Fixed async issue
 # ══════════════════════════════════════════════════════════════════════════════
 
 def evaluator_node(state: AgentState) -> AgentState:
     """
-    Evaluates the generated answer using RAGAS faithfulness metric.
-    Faithfulness measures whether the answer is grounded in the context.
-    Score of 1.0 = fully faithful, 0.0 = hallucinated.
+    Evaluates answer quality using RAGAS faithfulness metric.
+    Fixed: uses nest_asyncio to handle async inside FastAPI/uvloop.
     """
+    if not RAGAS_ENABLED:
+        return {**state, "faithfulness_score": None}
+
     print(f"\n📊 Evaluating answer quality...")
 
     try:
+        import nest_asyncio
+        nest_asyncio.apply()
+
         from ragas import evaluate
         from ragas.metrics import faithfulness
         from datasets import Dataset
-        from langchain_groq import ChatGroq
-        from langchain_core.embeddings import Embeddings
+        from ragas.llms import LangchainLLMWrapper
+        from ragas.embeddings import LangchainEmbeddingsWrapper
+        from backend.rag.embeddings import get_embeddings
 
-        # Build context list
         contexts = []
         if state.get("papers_context"):
             contexts.append(state["papers_context"])
@@ -460,18 +468,12 @@ def evaluator_node(state: AgentState) -> AgentState:
                 "eval_error": "Insufficient context for evaluation"
             }
 
-        # Prepare dataset for RAGAS
         eval_data = {
             "question": [state["question"]],
             "answer": [state["answer"]],
             "contexts": [contexts],
         }
         dataset = Dataset.from_dict(eval_data)
-
-        # Use Groq LLM for evaluation
-        from ragas.llms import LangchainLLMWrapper
-        from ragas.embeddings import LangchainEmbeddingsWrapper
-        from backend.rag.embeddings import get_embeddings
 
         groq_llm = ChatGroq(
             api_key=GROQ_API_KEY,
@@ -481,7 +483,6 @@ def evaluator_node(state: AgentState) -> AgentState:
         ragas_llm = LangchainLLMWrapper(groq_llm)
         ragas_embeddings = LangchainEmbeddingsWrapper(get_embeddings())
 
-        # Run evaluation
         result = evaluate(
             dataset=dataset,
             metrics=[faithfulness],
@@ -489,16 +490,18 @@ def evaluator_node(state: AgentState) -> AgentState:
             embeddings=ragas_embeddings
         )
 
-        score = float(result["faithfulness"])
+        # Handle both float and list return types from RAGAS
+        raw_score = result["faithfulness"]
+        if isinstance(raw_score, list):
+            score = float(raw_score[0])
+        else:
+            score = float(raw_score)
+
         print(f"   ✅ Faithfulness score: {score:.2f}")
 
-        return {
-            **state,
-            "faithfulness_score": score
-        }
+        return {**state, "faithfulness_score": score}
 
     except Exception as e:
-        # Evaluation failure should never break the answer
         print(f"   ⚠️  Evaluation skipped: {e}")
         return {
             **state,
@@ -510,9 +513,8 @@ def evaluator_node(state: AgentState) -> AgentState:
 if __name__ == "__main__":
     from backend.agent.state import get_initial_state
 
-    print("Testing individual nodes...\n")
+    print("Testing updated nodes...\n")
 
-    # Test router
     print("=" * 55)
     print("TEST 1: Router")
     print("=" * 55)
@@ -526,21 +528,20 @@ if __name__ == "__main__":
         state = get_initial_state(q)
         result = router_node(state)
         status = "✅" if result["route"] == expected else "⚠️"
-        print(f"   {status} '{q[:45]}' → {result['route']} (expected: {expected})")
+        print(f"   {status} '{q[:45]}' → {result['route']}")
 
-    # Test papers retriever
     print("\n" + "=" * 55)
-    print("TEST 2: Papers retriever")
+    print("TEST 2: Papers retriever + sufficiency check")
     print("=" * 55)
     state = get_initial_state("What techniques does the lab use?")
     state["route"] = "papers"
     result = papers_retriever_node(state)
-    print(f"   Papers context length : {len(result.get('papers_context', ''))}")
-    print(f"   Sources               : {result.get('sources', [])}")
+    print(f"   Papers context length  : {len(result.get('papers_context', ''))}")
+    print(f"   Needs PubMed fallback  : {result.get('needs_pubmed_fallback')}")
+    print(f"   Sources                : {result.get('sources', [])}")
 
-    # Test generator
     print("\n" + "=" * 55)
-    print("TEST 3: Full pipeline — router → retriever → generator")
+    print("TEST 3: Full pipeline with graph route")
     print("=" * 55)
     question = "What behavioral paradigms does the Shrestha lab study?"
     state = get_initial_state(question)
@@ -548,7 +549,7 @@ if __name__ == "__main__":
     state = graph_retriever_node(state)
     state = generator_node(state)
     print(f"\nQuestion: {question}")
-    print(f"\nAnswer:\n{state['answer']}")
+    print(f"\nAnswer:\n{state['answer'][:400]}...")
     print(f"\nSources: {state['sources']}")
 
-    print("\n✅ Nodes working correctly!")
+    print("\n✅ All nodes working correctly!")

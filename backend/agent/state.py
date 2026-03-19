@@ -45,6 +45,10 @@ class AgentState(TypedDict):
     # Sources used to generate the answer
     sources: Optional[list[str]]
 
+    # ── Fallback flag ─────────────────────────────────────────────────────────
+    # Set by reranker when local papers are insufficient — triggers PubMed
+    needs_pubmed_fallback: Optional[bool]
+
     # ── Evaluation ────────────────────────────────────────────────────────────
     # RAGAS faithfulness score (0.0 to 1.0)
     faithfulness_score: Optional[float]
@@ -69,6 +73,7 @@ def get_initial_state(question: str) -> AgentState:
         code_context=None,
         graph_context=None,
         pubmed_context=None,
+        needs_pubmed_fallback=False,
         answer=None,
         sources=None,
         faithfulness_score=None,

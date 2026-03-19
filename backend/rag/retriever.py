@@ -5,45 +5,80 @@ from typing import Optional
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 from config import TOP_K_RESULTS, PAPERS_COLLECTION, CODE_COLLECTION
 from backend.rag.vectorstore import similarity_search
+from backend.rag.reranker import get_reranker
 from backend.rag.knowledge_graph.graph_retriever import get_graph_retriever
 
 
 class UnifiedRetriever:
     """
-    Single interface combining ChromaDB vector search
-    and NetworkX knowledge graph traversal.
+    Single interface combining:
+    - ChromaDB vector search (semantic similarity)
+    - CrossEncoder reranking (true relevance scoring)
+    - NetworkX knowledge graph (logic-based traversal)
 
-    The agent calls this — it never talks to ChromaDB
-    or NetworkX directly. This class decides how to
-    retrieve based on what is being asked.
+    The agent calls this — it never talks to ChromaDB,
+    the reranker, or NetworkX directly.
     """
 
     def __init__(self):
         self.graph = get_graph_retriever()
+        self.reranker = get_reranker()
 
-    # ── Vector search ─────────────────────────────────────────────────────────
+    # ── Vector search with reranking ──────────────────────────────────────────
 
-    def search_papers(self, query: str, k: int = TOP_K_RESULTS) -> list[dict]:
+    def search_papers(
+        self,
+        query: str,
+        k: int = TOP_K_RESULTS
+    ) -> list[dict]:
         """
-        Semantic search over lab papers collection.
-        Best for: detailed scientific questions, methods, findings.
+        Two-stage retrieval over lab papers:
+        1. ChromaDB fetches top 20 by embedding similarity
+        2. CrossEncoder reranks and returns top k by true relevance
         """
-        return similarity_search(query, PAPERS_COLLECTION, k=k)
+        # Stage 1: broad vector search
+        raw_results = similarity_search(query, PAPERS_COLLECTION, k=k)
 
-    def search_code(self, query: str, k: int = TOP_K_RESULTS) -> list[dict]:
+        # Stage 2: rerank for true relevance
+        reranked = self.reranker.rerank(query, raw_results, top_k=k)
+
+        return reranked
+
+    def search_code(
+        self,
+        query: str,
+        k: int = TOP_K_RESULTS
+    ) -> list[dict]:
         """
-        Semantic search over pipeline code collection.
-        Best for: how something is implemented, specific function logic.
+        Two-stage retrieval over pipeline code:
+        1. ChromaDB fetches top 20 by embedding similarity
+        2. CrossEncoder reranks and returns top k by true relevance
         """
-        return similarity_search(query, CODE_COLLECTION, k=k)
+        # Stage 1: broad vector search
+        raw_results = similarity_search(query, CODE_COLLECTION, k=k)
+
+        # Stage 2: rerank for true relevance
+        reranked = self.reranker.rerank(query, raw_results, top_k=k)
+
+        return reranked
+
+    def papers_are_sufficient(self, query: str, chunks: list[dict]) -> bool:
+        """
+        Checks if retrieved paper chunks actually answer the query.
+        Used to decide whether PubMed fallback is needed.
+        Returns False if local knowledge base doesn't have the answer.
+        """
+        return self.reranker.chunks_are_sufficient(
+            query,
+            chunks,
+            threshold=-2.0,
+            min_good_chunks=1
+        )
 
     # ── Graph queries ─────────────────────────────────────────────────────────
 
     def get_lab_overview(self) -> str:
-        """
-        Returns structured lab overview from knowledge graph.
-        Best for: 'What does this lab do?' type questions.
-        """
+        """Returns structured lab overview from knowledge graph."""
         overview = self.graph.get_lab_overview()
         lines = []
 
@@ -72,14 +107,10 @@ class UnifiedRetriever:
                 lines.append(f"  - {b['label']}: {b.get('description', '')}")
 
         lines.append(f"\nTotal papers published: {overview.get('paper_count', 0)}")
-
         return "\n".join(lines)
 
     def get_file_dependencies(self, filename: str) -> str:
-        """
-        Returns dependency tree for a code file.
-        Best for: 'What does X depend on?' questions.
-        """
+        """Returns dependency tree for a code file."""
         deps = self.graph.get_file_dependencies(filename)
         if not deps:
             return f"No dependency information found for '{filename}'"
@@ -90,20 +121,14 @@ class UnifiedRetriever:
         return "\n".join(lines)
 
     def get_file_description(self, filename: str) -> str:
-        """
-        Returns description of a specific code file.
-        Best for: 'What does X file do?' questions.
-        """
+        """Returns description of a specific code file."""
         info = self.graph.get_file_description(filename)
         if not info:
             return f"No information found for '{filename}'"
         return f"{info['label']}: {info.get('description', 'No description available')}"
 
     def get_all_code_files(self) -> str:
-        """
-        Returns list of all pipeline files with descriptions.
-        Best for: 'What files are in the pipeline?' questions.
-        """
+        """Returns list of all pipeline files with descriptions."""
         files = self.graph.get_all_code_files()
         if not files:
             return "No code files found in knowledge graph."
@@ -114,10 +139,7 @@ class UnifiedRetriever:
         return "\n".join(lines)
 
     def search_graph(self, keyword: str) -> str:
-        """
-        Keyword search across all graph nodes.
-        Best for: finding anything related to a concept.
-        """
+        """Keyword search across all graph nodes."""
         results = self.graph.search_by_keyword(keyword)
         if not results:
             return f"Nothing found in knowledge graph for '{keyword}'"
@@ -133,15 +155,11 @@ class UnifiedRetriever:
         k: int = TOP_K_RESULTS
     ) -> str:
         """
-        Combined retrieval — fetches from whichever sources are relevant
-        and merges results into one context string for the LLM.
-
-        The agent calls this for general questions where it
-        wants both vector and graph context.
+        Combined retrieval with reranking — fetches from whichever
+        sources are relevant and merges into one context string.
         """
         context_parts = []
 
-        # Vector search over papers
         if search_papers:
             paper_results = self.search_papers(question, k=k)
             if paper_results:
@@ -149,14 +167,11 @@ class UnifiedRetriever:
                 context_parts.append("=" * 40)
                 for i, r in enumerate(paper_results, 1):
                     source = r["metadata"].get("source", "unknown")
-                    score = r.get("relevance_score", 0)
-                    context_parts.append(
-                        f"[{i}] Source: {source} (relevance: {score})"
-                    )
+                    score = r.get("reranker_score", r.get("relevance_score", 0))
+                    context_parts.append(f"[{i}] Source: {source} (score: {score:.3f})")
                     context_parts.append(r["content"])
                     context_parts.append("-" * 40)
 
-        # Vector search over code
         if search_code:
             code_results = self.search_code(question, k=k)
             if code_results:
@@ -168,9 +183,8 @@ class UnifiedRetriever:
                     context_parts.append(r["content"])
                     context_parts.append("-" * 40)
 
-        # Graph keyword search
         graph_results = self.graph.search_by_keyword(
-            question.split()[0]  # use first word as keyword
+            question.split()[0]
         )
         if graph_results:
             context_parts.append("\nRELATED CONCEPTS FROM KNOWLEDGE GRAPH:")
@@ -183,16 +197,15 @@ class UnifiedRetriever:
         return "\n".join(context_parts)
 
     def format_vector_results(self, results: list[dict]) -> str:
-        """
-        Formats raw vector search results into clean text for LLM.
-        """
+        """Formats raw vector search results into clean text for LLM."""
         if not results:
             return "No results found."
 
         lines = []
         for i, r in enumerate(results, 1):
             source = r["metadata"].get("source", "unknown")
-            lines.append(f"[Source: {source}]")
+            score = r.get("reranker_score", r.get("relevance_score", 0))
+            lines.append(f"[{i}] Source: {source} | Score: {score:.3f}")
             lines.append(r["content"])
             lines.append("")
 
@@ -211,38 +224,37 @@ def get_retriever() -> UnifiedRetriever:
 
 
 if __name__ == "__main__":
-    print("Testing UnifiedRetriever...\n")
+    print("Testing UnifiedRetriever with reranking...\n")
     retriever = get_retriever()
 
     print("=" * 55)
-    print("TEST 1: Lab overview from graph")
+    print("TEST 1: Paper search with reranking")
     print("=" * 55)
-    overview = retriever.get_lab_overview()
-    print(overview)
-
-    print("\n" + "=" * 55)
-    print("TEST 2: Vector search over papers")
-    print("=" * 55)
-    results = retriever.search_papers("dopamine signaling during fear conditioning", k=2)
+    results = retriever.search_papers(
+        "dopamine signaling during fear conditioning", k=3
+    )
     for r in results:
-        print(f"Source : {r['metadata']['source']}")
-        print(f"Score  : {r['relevance_score']}")
-        print(f"Preview: {r['content'][:150]}")
+        print(f"Source        : {r['metadata']['source']}")
+        print(f"Reranker score: {r.get('reranker_score', 'N/A'):.3f}")
+        print(f"Preview       : {r['content'][:100]}")
         print()
 
     print("=" * 55)
-    print("TEST 3: Vector search over code")
+    print("TEST 2: Sufficiency check")
     print("=" * 55)
-    results = retriever.search_code("baseline correction z-score normalization", k=2)
+    sufficient = retriever.papers_are_sufficient(
+        "dopamine signaling during fear conditioning", results
+    )
+    print(f"Papers sufficient? {sufficient}")
+
+    print("\n=" * 55)
+    print("TEST 3: Code search with reranking")
+    print("=" * 55)
+    results = retriever.search_code("z-score normalization baseline", k=3)
     for r in results:
-        print(f"File   : {r['metadata']['source']}")
-        print(f"Preview: {r['content'][:150]}")
+        print(f"File          : {r['metadata']['source']}")
+        print(f"Reranker score: {r.get('reranker_score', 'N/A'):.3f}")
+        print(f"Preview       : {r['content'][:100]}")
         print()
 
-    print("=" * 55)
-    print("TEST 4: File dependencies")
-    print("=" * 55)
-    deps = retriever.get_file_dependencies("saa_mouse.py")
-    print(deps)
-
-    print("\n✅ UnifiedRetriever working correctly!")
+    print("✅ UnifiedRetriever with reranking working correctly!")

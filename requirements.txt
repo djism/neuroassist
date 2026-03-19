@@ -40,3 +40,9 @@ httpx
 
 # Utils
 python-dotenv
+
+# Reranker
+sentence-transformers
+
+# Fix Chroma deprecation
+langchain-chroma
